@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>V-ON-Title</title>
+    <script src="js/vuejs-2.5.16.js"></script>
+</head>
+<body>
+<div id="app">
+    <form @submit.prevent action="https://www.baidu.com"  method="get">
+        <input type="submit" value="提交">
+    </form>
+        <a v-on:click.stop href="https://www.baidu.com">itcast</a>
+
+
+    <!--按键修饰符-->
+    <input type="text" v-on:keyup.enter="fun1">
+
+
+
+    <div v-text="message"></div>
+    <div v-html="message"></div>
+    <font v-bind:color="y1">1122</font>
+    <font :color="y2">1133</font>
+    <a v-bind={href:"http://www.baidu.com"+id}>it</a>
+</div>
+    <script>
+        new Vue({
+            el:"#app",
+            data:{
+                message:"<h1>腾讯视频</h1>",
+                y1:"red",
+                y2:"green",
+                id:1
+            },
+            methods:{
+                fun1:function () {
+                    alert("你按了回车")
+                }
+            }
+        });
+    </script>
+</body>
+</html>

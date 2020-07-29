@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+    <script src="js/vuejs-2.5.16.js"></script>
+</head>
+<body>
+    <div id="app">
+        {{message}}
+        {{demo+6}}
+        {{6>5?'YES':'NO'}}
+    </div>
+    <script>
+        new Vue({
+            el:"#app",//表示当前vue对象接管了div区域
+            data:{
+                message:'hello world',//注意不要写分号结尾
+                demo:24
+            }
+        });
+    </script>
+</body>
+</html>

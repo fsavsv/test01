@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:v-on="http://www.w3.org/1999/xhtml">
+<head>
+    <meta charset="UTF-8">
+    <title>V-ON-Title</title>
+    <script src="js/vuejs-2.5.16.js"></script>
+</head>
+<body>
+<!--v-on:onclick-->
+<div id="app">
+    {{message}}
+    <button v-on:click="fun1('good')">点击改变</button>
+    <input type="text" v-on:keydown="fun2('good',$event)">
+    <br>
+    <br>
+    <br>
+    <br>
+   <!-- <div id="div" style="background-color: blue;width: 300px" v-on:mouseover="fun3">
+        <textarea v-on:mouseover="fun4($event)" style="background-color: red;width: 150px">这是一个文件域</textarea>
+    </div>-->
+</div>
+<script>
+    new Vue({
+        el:"#app",//表示当前vue对象接管了div区域
+        data:{
+            message:'hello world',//注意不要写分号结尾
+        },
+        methods:{
+            fun1:function(msg){
+                this.message=msg;
+            },
+            fun2:function (msg,event) {
+                if(!((event.keyCode>=48&&event<=57)||event.keyCode==8||event.keyCode==46)){
+                    //alert(event.keyCode);
+                    this.message=event.keyCode;
+                    event.preventDefault();
+                }
+            }/*,
+            fun3:function () {
+                alert("div");
+            },
+            fun4:function (event) {
+                alert("textarea");
+                event.stopPropagation();//阻止冒泡
+            }*/
+        }
+    });
+</script>
+</body>
+</html>
