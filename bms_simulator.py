@@ -2,7 +2,7 @@
 """仓控板 BMS 模拟器（CAN 2.0B 扩展帧 / 250 kbit/s）
 
 每 5 秒（可通过界面修改）上传一次电池 BMS 信息，共 18 帧：
-  0x18101070 ~ 0x18211070
+  0x1810107B ~ 0x1821107B
 
 只覆盖协议中的三个字段，其余字节原样使用真实电池数据：
   SOC           Byte 48-49   uint16 LE, 1%
@@ -38,19 +38,19 @@ FRAME_GAP_SECONDS = 0.5
 
 # 真实电池数据（142 字节，最后一帧 DLC=6）
 BASE_PAYLOAD = bytes.fromhex(
-	"00000000000000000000000047463031464246375730383130313030"
-	"30333700000000000000000000000000cf1410000b00560164000000"
-	"190015001b00030d020d020d030d000d010d020d030d020d000d010d"
-	"010d020d010d010d020d000000000000000016000109dc0534170000"
-	"000b0705010101000b00b80b980b0b00000000000000000000000000"
-	"65ba"
+    "0001000000000000000000004b414142453035423236483030303031"
+    "00000000000000000000000000000000201f14004e00f31164000000"
+    "170017001700920f900f910f930f930f910f900f8e0f8e0f8f0f8e0f"
+    "8f0f8f0f8d0f920f920f910f8f0f900f8f0f17000000c8010221ffff"
+    "0001000100010000000070170f170400030000000000000000000000"
+    "0308"
 )
 
 SOC_OFFSET = 48
 MIN_CELL_TEMP_OFFSET = 58
 MAX_CELL_TEMP_OFFSET = 102
 
-FRAME_IDS = tuple(0x18101070 + (i << 16) for i in range(18))
+FRAME_IDS = tuple(0x1810107B + (i << 16) for i in range(18))
 
 assert len(BASE_PAYLOAD) == 142, f"模板长度异常: {len(BASE_PAYLOAD)}"
 assert len(FRAME_IDS) == 18
@@ -216,80 +216,27 @@ CONTROLCAN_CANDIDATES = (
     Path(__file__).resolve().parent / "ControlCAN.dll",
     Path(r"D:\Tool\CAN分析仪资料20220714\二次开发库文件\x64\ControlCAN.dll"),
     Path(r"C:\Windows\System32\ControlCAN.dll"),
-    # 厂家示例源码里自带的那份通常是 32 位，排在真正的 x64 路径之后，避免误选
+    # 厂家示例源码里这份通常是 32 位，排在真正的 x64 路径之后避免误选
     Path(r"D:\Tool\CAN分析仪资料20220714\二次开发示例源代码\python(x64)\python3.8.0推荐\ControlCAN.dll"),
 )
 
 
 def _pe_machine(path: Path) -> int | None:
-    """读取 PE 文件的机器类型：0x8664=AMD64(x64)，0x014c=i386(x86/32位)，读不到返回 None。"""
+    """读 PE 头的 Machine 字段：0x8664=AMD64(x64)，0x014c=i386(x86)。"""
     try:
         with path.open("rb") as f:
             f.seek(0x3C)
             pe_offset = int.from_bytes(f.read(4), "little")
-            f.seek(pe_offset + 4)  # 跳过 PE\\0\\0 签名
+            f.seek(pe_offset + 4)
             return int.from_bytes(f.read(2), "little")
     except OSError:
         return None
 
 
-def _describe_bits(machine: int | None) -> str:
-    if machine is None:
-        return "未知/读不到"
-    if machine == 0x8664:
-        return "64 位 (x64)"
-    if machine == 0x014c:
-        return "32 位 (x86)"
-    return f"PE 0x{machine:04X}（非常规 DLL）"
-
-
-def diagnose_controlcan_dlls() -> list[dict]:
-    """扫描所有候选 ControlCAN.dll，返回每项的详情。"""
-    expected = 0x8664 if sys.maxsize > 2**32 else 0x014c
-    py_bits = 64 if sys.maxsize > 2**32 else 32
-    result: list[dict] = []
-    for path in CONTROLCAN_CANDIDATES:
-        exists = path.is_file()
-        machine = _pe_machine(path) if exists else None
-        bits_match = (machine is not None and machine == expected)
-        result.append({
-            "path": str(path),
-            "exists": exists,
-            "machine": machine,
-            "bits_desc": _describe_bits(machine),
-            "bits_match": bits_match,
-            "py_bits": py_bits,
-        })
-    return result
-
-
-def diagnose_controlcan_text() -> str:
-    items = diagnose_controlcan_dlls()
-    py_bits = items[0]["py_bits"] if items else (64 if sys.maxsize > 2**32 else 32)
-    header = f"当前 Python {py_bits} 位 · ControlCAN.dll 候选诊断："
-    lines = [header]
-    for item in items:
-        if not item["exists"]:
-            tag = "缺失"
-            detail = ""
-        elif item["bits_match"]:
-            tag = "✓ 可用"
-            detail = ""
-        elif item["machine"] is None:
-            tag = "?"
-            detail = "(PE 头读不到)"
-        else:
-            tag = "× 位数不匹配"
-            detail = f"(需要 {py_bits} 位，实际 {item['bits_desc']})"
-        tail = f"  ← 优先候选" if item["bits_match"] else ""
-        lines.append(f"  {tag}  {item['path']}  {item['bits_desc']}{detail}{tail}")
-    return "\n".join(lines)
-
-
 def find_controlcan_dll() -> str:
-    """按当前 Python 位数优先挑选匹配的 ControlCAN.dll，避免 32/64 位不匹配导致 WinError 193。"""
-    expected = 0x8664 if sys.maxsize > 2**32 else 0x014c  # x64 或 x86
-    found: list[tuple[int, int, str]] = []  # (优先级, 原始索引, 路径)
+    """按当前 Python 位数挑选匹配的 ControlCAN.dll，避免位数不匹配导致 WinError 193。"""
+    expected = 0x8664 if sys.maxsize > 2**32 else 0x014c
+    found: list[tuple[int, int, str]] = []
     for idx, path in enumerate(CONTROLCAN_CANDIDATES):
         if not path.is_file():
             continue
@@ -346,29 +293,48 @@ class CanalystIIBus:
         if not dll_file.is_file():
             raise FileNotFoundError(f"找不到 ControlCAN.dll：{dll_path}")
 
-        # 提前校验位数，避免 ctypes 抛出晦涩的 WinError 193（BadImageFormat）
+        # --- 适配 ControlCAN.dll 的关键三步 ---
+        # 1. 提前校验位数，避免 ctypes 抛出晦涩的 WinError 193（BadImageFormat）
         pe_machine = _pe_machine(dll_file)
+        py_bits = 64 if sys.maxsize > 2**32 else 32
         if pe_machine is not None:
-            py_bits = 64 if sys.maxsize > 2**32 else 32
-            if pe_machine not in (0x014c, 0x8664):
+            dll_bits = 64 if pe_machine == 0x8664 else (32 if pe_machine == 0x014c else -1)
+            if dll_bits < 0:
                 raise ImportError(
                     f"无法识别 {dll_file.name} 的 PE 机器类型（0x{pe_machine:04X}），"
                     f"请确认这是 CANalyst-II 配套的 ControlCAN.dll。"
                 )
-            dll_bits = 64 if pe_machine == 0x8664 else 32
             if dll_bits != py_bits:
                 raise ImportError(
-                    f"ControlCAN.dll 位数与 Python 不匹配：当前 Python 是 {py_bits} 位，"
-                    f"但 {dll_file.name} 是 {dll_bits} 位。\n"
-                    f"请改用 {dll_bits} 位的 Python，或在“DLL 路径”处浏览选择 {py_bits} 位的 ControlCAN.dll。\n"
-                    f"典型路径：ZLG 官方随盘一般同时提供 x64 和 x86 两个子目录。\n\n"
-                    f"{diagnose_controlcan_text()}"
+                    f"ControlCAN.dll 位数与当前 Python 不匹配：Python {py_bits} 位，"
+                    f"{dll_file.name} {dll_bits} 位。\n"
+                    f"解决办法：改用 {dll_bits} 位 Python，或重新选择 {py_bits} 位的 ControlCAN.dll。"
                 )
 
+        # 2. 把 DLL 所在目录加入搜索路径，避免厂家 DLL 解析依赖时命中 PATH 中同名但不兼容的 DLL
+        dll_dir = str(dll_file.parent)
+        dll_dir_handle = None
+        add_dll_dir = getattr(os, "add_dll_directory", None)
+        if add_dll_dir is not None:
+            try:
+                dll_dir_handle = add_dll_dir(dll_dir)
+            except OSError:
+                dll_dir_handle = None
+        if dll_dir_handle is None and dll_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
+
+        # 3. 传入绝对路径加载，避免 ctypes 因工作目录变化加载到错误位置的同名 DLL
         self._channel = channel
         self._device_index = device_index
         self._closed = False
-        self._dll = ctypes.WinDLL(str(dll_file))
+        self._dll_dir_handle = dll_dir_handle
+        try:
+            self._dll = ctypes.WinDLL(str(dll_file.resolve()))
+        except FileNotFoundError as exc:
+            raise ImportError(
+                f"ControlCAN.dll 加载失败，可能缺少厂家运行时依赖：{exc}\n"
+                f"当前 DLL 目录：{dll_dir}"
+            )
         self._dll.VCI_OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
         self._dll.VCI_OpenDevice.restype = ctypes.c_uint
         self._dll.VCI_InitCAN.argtypes = [
@@ -419,8 +385,16 @@ class CanalystIIBus:
 
     def shutdown(self) -> None:
         if not self._closed:
-            self._dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
-            self._closed = True
+            try:
+                self._dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
+            finally:
+                self._closed = True
+                handle = getattr(self, "_dll_dir_handle", None)
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
 
 
 # ------------------- 终端电流请求日志 -------------------
@@ -641,24 +615,6 @@ class BMSApp:
         )
 
         self._build_ui()
-
-        # 启动时打印 ControlCAN.dll 诊断，并在所有候选都不匹配时自动回退到虚拟总线
-        py_bits = 64 if sys.maxsize > 2**32 else 32
-        diagnosis = diagnose_controlcan_dlls()
-        has_match = any(item["bits_match"] for item in diagnosis)
-        if self.iface_var.get() == CANALYST_IFACE and not has_match:
-            self.iface_var.set("虚拟总线（测试）")
-            self.channel_var.set("bms-sim")
-            self._log(
-                f"检测到所有候选 ControlCAN.dll 都无法在当前 {py_bits} 位 Python 下加载，"
-                f"已自动切换为【虚拟总线（测试）】。\n"
-                f"{diagnose_controlcan_text()}\n"
-                f"说明：虚拟总线可以正常发报文、跑自动化验证、不依赖任何硬件；"
-                f"等你装好了 {py_bits} 位的 ControlCAN.dll，在界面接口下拉里切回 CANalyst-II 即可。"
-            )
-        else:
-            self._log(diagnose_controlcan_text())
-
         self.soc_var.trace_add("write", self._on_input_changed)
         self.temp_var.trace_add("write", self._on_input_changed)
         self.period_var.trace_add("write", self._on_period_changed)
@@ -709,7 +665,7 @@ class BMSApp:
         ttk.Label(outer, text="仓控板 BMS 模拟器", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="CAN 2.0B 扩展帧 · 250 kbit/s · 上报周期可配置（默认 5 秒） · 每轮 18 帧 · EXTID 0x18101070 ~ 0x18211070",
+            text="CAN 2.0B 扩展帧 · 250 kbit/s · 上报周期可配置（默认 5 秒） · 每轮 18 帧 · EXTID 0x1810107B ~ 0x1821107B",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 12))
 
@@ -1866,11 +1822,6 @@ class BMSApp:
 
 
 def main() -> None:
-    py_bits = 64 if sys.maxsize > 2**32 else 32
-    print(f"[BMS 模拟器] Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} {py_bits} 位 · 进程 PID={os.getpid()}")
-    print(diagnose_controlcan_text())
-    print()
-
     try:
         import ctypes
 
