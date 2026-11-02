@@ -94,3 +94,9 @@ def parse_request(frame: bytes):
 
 def format_hex(data: bytes) -> str:
     return " ".join(f"{b:02X}" for b in data)
+
+
+def format_hex_wrapped(data: bytes, per_line: int = 16, indent: str = "    ") -> str:
+    """长帧按每行 16 字节换行，便于日志阅读。"""
+    chunks = [format_hex(data[i:i + per_line]) for i in range(0, len(data), per_line)]
+    return f"\n{indent}".join(chunks)

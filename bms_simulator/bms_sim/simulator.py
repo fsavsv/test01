@@ -32,7 +32,7 @@ class Simulator:
         try:
             addr, func, start, count, values = modbus.parse_request(frame)
         except ValueError as exc:
-            return SimResult(None, f"接收 {modbus.format_hex(frame)}", "", str(exc))
+            return SimResult(None, "", "", f"报文解析失败：{exc}")
 
         if addr not in (0, self.address):
             return SimResult(

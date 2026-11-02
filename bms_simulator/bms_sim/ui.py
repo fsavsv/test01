@@ -825,7 +825,13 @@ class MainWindow(QMainWindow):
         color = {"rx": "#5b6572", "tx": "#2563eb", "err": "#dc2626",
                  "info": "#8a9099"}.get(level, "#5b6572")
         tag = {"rx": "RX", "tx": "TX", "err": "ERR", "info": "·"}.get(level, "")
-        safe = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        parts = text.split("\n")
+        safe = (parts[0].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        if len(parts) > 1:
+            safe += "".join(
+                "<br>&nbsp;&nbsp;&nbsp;&nbsp;" +
+                p.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                for p in parts[1:])
         self.log_view.appendHtml(
             f'<span style="color:#a0a6ad">[{stamp}]</span> '
             f'<span style="color:{color}">{tag} {safe}</span>')
@@ -898,7 +904,7 @@ class MainWindow(QMainWindow):
             return
         if not data:
             return
-        self._log("rx", f"接收 {modbus.format_hex(data)}")
+        self._log("rx", f"接收 {modbus.format_hex_wrapped(data)}")
         result = self.sim.handle(data)
         lines = []
         if result.rx_desc:
@@ -907,10 +913,11 @@ class MainWindow(QMainWindow):
             lines.append(f"错误：{result.error}")
             self._log("err", result.error)
         if result.response:
-            lines.append(f"应答：{modbus.format_hex(result.response)}")
+            hex_text = modbus.format_hex_wrapped(result.response)
+            lines.append(f"应答：{hex_text}")
             if result.tx_desc:
                 lines.append(f"说明：{result.tx_desc}")
-            self._log("tx", f"发送 {modbus.format_hex(result.response)}")
+            self._log("tx", f"发送 {hex_text}")
             if result.tx_desc:
                 self._log("info", result.tx_desc)
         else:
@@ -981,9 +988,14 @@ class MainWindow(QMainWindow):
             self.dot_label.setStyleSheet("color:#16a34a;")
             self.detail_label.setText(
                 f"· {message} · 地址 0x{self.sim.address:02X}")
+            self.bar_state.setText(f"运行中 · {self.port_combo.currentText()} · "
+                                   f"{self.baud_combo.currentText()}bps")
+            self.bar_state.setStyleSheet("color:#16a34a;")
         else:
             self.state_label.setText("已停止")
             self.dot_label.setStyleSheet("color:#a0a6ad;")
+            self.bar_state.setText("已停止")
+            self.bar_state.setStyleSheet("color:#8a9099;")
             if message != "已停止":
                 self.detail_label.setText(f"· {message}")
                 self.state_label.setStyleSheet("color:#dc2626;")
@@ -999,8 +1011,11 @@ class MainWindow(QMainWindow):
             self.refresh_btn.setEnabled(True)
             self.worker = None
 
-    def _on_counters(self, rx: int, tx: int) -> None:
-        self.counter_label.setText(f"接收 {rx} 帧 · 应答 {tx} 帧")
+    def _on_counters(self, rx: int, tx: int, err: int) -> None:
+        text = f"接收 {rx} 帧 · 应答 {tx} 帧"
+        if err:
+            text += f" · 异常 {err}"
+        self.counter_label.setText(text)
 
     def _on_values_changed(self) -> None:
         for addr in (118, 202, 203):
