@@ -39,8 +39,8 @@ if "%CUR_BITS%"=="64" (
 REM --- 2. 找 32 位 Python ---
 set "PY32="
 
-REM 先搜常见安装位置
-for %%D in ("C:\Python38-32" "C:\Python39-32" "C:\Python310-32" "C:\Python311-32" "C:\Python312-32") do (
+REM 先搜常见安装位置（含本脚本静默安装的默认位置）
+for %%D in ("%LocalAppData%\Programs\Python\Python38-32" "C:\Python38-32" "C:\Python39-32" "C:\Python310-32" "C:\Python311-32" "C:\Python312-32") do (
     if exist "%%~D\python.exe" (
         for /f "tokens=*" %%B in ('"%%~D\python.exe" -c "import struct; print(struct.calcsize('P')*8)" 2^>nul') do set "BITS=%%B"
         if "!BITS!"=="32" (
@@ -78,6 +78,13 @@ if %errorlevel%==0 (
 )
 
 if not "%PY32%"=="" goto :found
+
+REM --- 2.5 同目录自带安装包 → 直接静默安装，无需联网 ---
+if exist "%SCRIPT_DIR%python-3.8.10.exe" (
+    echo [提示] 发现同目录的 python-3.8.10.exe，将静默安装 32 位 Python 3.8.10
+    call "%SCRIPT_DIR%install_python38_32.bat" --auto
+    goto :recheck
+)
 
 REM --- 3. 没找到 → 下载安装 ---
 echo.
@@ -137,7 +144,7 @@ if "%CUR_BITS%"=="32" (
     echo [检测] 当前 python 已经是 32 位了！
     goto :found
 )
-for %%D in ("C:\Python312-32" "C:\Python311-32" "C:\Python310-32" "C:\Python39-32" "C:\Python38-32") do (
+for %%D in ("%LocalAppData%\Programs\Python\Python38-32" "C:\Python312-32" "C:\Python311-32" "C:\Python310-32" "C:\Python39-32" "C:\Python38-32") do (
     if exist "%%~D\python.exe" (
         for /f "tokens=*" %%B in ('"%%~D\python.exe" -c "import struct; print(struct.calcsize('P')*8)" 2^>nul') do set "BITS=%%B"
         if "!BITS!"=="32" (
