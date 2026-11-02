@@ -213,11 +213,18 @@ CANALYST_IFACE = "CANalyst-II（ZLG）"
 VCI_USBCAN2 = 4
 
 CONTROLCAN_CANDIDATES = (
+    # --- ControlCAN（VCI 旧栈，通常只有 32 位）---
     Path(__file__).resolve().parent / "ControlCAN.dll",
     Path(r"D:\Tool\CAN分析仪资料20220714\二次开发库文件\x64\ControlCAN.dll"),
-    Path(r"C:\Windows\System32\ControlCAN.dll"),
-    # 厂家示例源码里这份通常是 32 位，排在真正的 x64 路径之后避免误选
     Path(r"D:\Tool\CAN分析仪资料20220714\二次开发示例源代码\python(x64)\python3.8.0推荐\ControlCAN.dll"),
+    Path(r"C:\Windows\System32\ControlCAN.dll"),
+    # --- zlgcan（新栈，官方同时提供 x86 和 x64，向下兼容 CANalyst-II）---
+    Path(__file__).resolve().parent / "zlgcan.dll",
+    Path(__file__).resolve().parent / "zlgcan_x64.dll",
+    Path(__file__).resolve().parent / "zlgcan_x86.dll",
+    Path(r"D:\Tool\CAN分析仪资料20220714\CAN接口卡二次开发接口函数库\zlgcan.dll"),
+    Path(r"D:\Tool\CAN分析仪资料20220714\CAN接口卡二次开发接口函数库\x64\zlgcan.dll"),
+    Path(r"C:\Windows\System32\zlgcan.dll"),
 )
 
 
@@ -234,19 +241,21 @@ def _pe_machine(path: Path) -> int | None:
 
 
 def find_controlcan_dll() -> str:
-    """按当前 Python 位数挑选匹配的 ControlCAN.dll，避免位数不匹配导致 WinError 193。"""
+    """按当前 Python 位数挑选匹配的 DLL。优先 zlgcan 新栈（有 x64），其次 ControlCAN（通常仅 x86）。"""
     expected = 0x8664 if sys.maxsize > 2**32 else 0x014c
     found: list[tuple[int, int, str]] = []
     for idx, path in enumerate(CONTROLCAN_CANDIDATES):
         if not path.is_file():
             continue
         machine = _pe_machine(path)
+        # 0: zlgcan 位数匹配, 1: ControlCAN 位数匹配, 2: zlgcan 位数不匹配, 3: ControlCAN 位数不匹配, 4: PE 读不到
+        is_zlg = "zlgcan" in path.name.lower()
         if machine == expected:
-            priority = 0
+            priority = 0 if is_zlg else 1
         elif machine is None:
-            priority = 1
+            priority = 4
         else:
-            priority = 2
+            priority = 2 if is_zlg else 3
         found.append((priority, idx, str(path)))
     if not found:
         return ""
@@ -280,8 +289,44 @@ class _VCI_CAN_OBJ(ctypes.Structure):
     ]
 
 
+# --- zlgcan 新栈结构（向下兼容 CANalyst-II，有 x64 版本）---
+class _ZLG_INIT_CONFIG(ctypes.Structure):
+    """zlgcan 经典 CAN 通道初始化配置，布局与 VCI_INIT_CONFIG 一致。"""
+    _fields_ = [
+        ("acc_code", ctypes.c_uint),
+        ("acc_mask", ctypes.c_uint),
+        ("reserved", ctypes.c_uint),
+        ("filter", ctypes.c_ubyte),
+        ("timing0", ctypes.c_ubyte),
+        ("timing1", ctypes.c_ubyte),
+        ("mode", ctypes.c_ubyte),
+    ]
+
+
+class _ZLG_CAN_FRAME(ctypes.Structure):
+    """zlgcan 经典 CAN 单帧结构。"""
+    _fields_ = [
+        ("can_id", ctypes.c_uint, 29),
+        ("err", ctypes.c_uint, 1),
+        ("rtr", ctypes.c_uint, 1),
+        ("eff", ctypes.c_uint, 1),
+        ("can_dlc", ctypes.c_ubyte),
+        ("__pad", ctypes.c_ubyte),
+        ("__res0", ctypes.c_ubyte),
+        ("__res1", ctypes.c_ubyte),
+        ("data", ctypes.c_ubyte * 8),
+    ]
+
+
+class _ZLG_TRANSMIT_DATA(ctypes.Structure):
+    _fields_ = [("frame", _ZLG_CAN_FRAME), ("transmit_type", ctypes.c_uint)]
+
+
+ZLG_USBCAN2 = 4  # USBCAN / CANalyst-II 系列
+
+
 class CanalystIIBus:
-    """用厂家 ControlCAN.dll 发送扩展帧，接口与 python-can 的 Bus 兼容。"""
+    """厂家 ZLG CAN 卡发送适配层，自动识别是 ControlCAN（VCI 旧栈）还是 zlgcan（新栈）。"""
 
     def __init__(self, dll_path: str, channel: int = 0, bitrate: int = CAN_BITRATE,
                  device_index: int = 0) -> None:
@@ -291,27 +336,24 @@ class CanalystIIBus:
             raise ValueError("CANalyst-II 通道只能为 0 或 1。")
         dll_file = Path(dll_path)
         if not dll_file.is_file():
-            raise FileNotFoundError(f"找不到 ControlCAN.dll：{dll_path}")
+            raise FileNotFoundError(f"找不到 DLL：{dll_path}")
 
-        # --- 适配 ControlCAN.dll 的关键三步 ---
-        # 1. 提前校验位数，避免 ctypes 抛出晦涩的 WinError 193（BadImageFormat）
-        pe_machine = _pe_machine(dll_file)
         py_bits = 64 if sys.maxsize > 2**32 else 32
+        pe_machine = _pe_machine(dll_file)
         if pe_machine is not None:
             dll_bits = 64 if pe_machine == 0x8664 else (32 if pe_machine == 0x014c else -1)
             if dll_bits < 0:
                 raise ImportError(
                     f"无法识别 {dll_file.name} 的 PE 机器类型（0x{pe_machine:04X}），"
-                    f"请确认这是 CANalyst-II 配套的 ControlCAN.dll。"
+                    f"请确认这是 ZLG 配套的 CAN DLL。"
                 )
             if dll_bits != py_bits:
                 raise ImportError(
-                    f"ControlCAN.dll 位数与当前 Python 不匹配：Python {py_bits} 位，"
+                    f"DLL 位数与当前 Python 不匹配：Python {py_bits} 位，"
                     f"{dll_file.name} {dll_bits} 位。\n"
-                    f"解决办法：改用 {dll_bits} 位 Python，或重新选择 {py_bits} 位的 ControlCAN.dll。"
+                    f"解决办法：改用 {dll_bits} 位 Python，或重新选择 {py_bits} 位的 DLL。"
                 )
 
-        # 2. 把 DLL 所在目录加入搜索路径，避免厂家 DLL 解析依赖时命中 PATH 中同名但不兼容的 DLL
         dll_dir = str(dll_file.parent)
         dll_dir_handle = None
         add_dll_dir = getattr(os, "add_dll_directory", None)
@@ -323,49 +365,71 @@ class CanalystIIBus:
         if dll_dir_handle is None and dll_dir not in os.environ.get("PATH", ""):
             os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
 
-        # 3. 传入绝对路径加载，避免 ctypes 因工作目录变化加载到错误位置的同名 DLL
         self._channel = channel
         self._device_index = device_index
         self._closed = False
         self._dll_dir_handle = dll_dir_handle
+
         try:
             self._dll = ctypes.WinDLL(str(dll_file.resolve()))
         except FileNotFoundError as exc:
             raise ImportError(
-                f"ControlCAN.dll 加载失败，可能缺少厂家运行时依赖：{exc}\n"
-                f"当前 DLL 目录：{dll_dir}"
+                f"{dll_file.name} 加载失败，可能缺少厂家运行时依赖：{exc}\n当前 DLL 目录：{dll_dir}"
             )
-        self._dll.VCI_OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self._dll.VCI_OpenDevice.restype = ctypes.c_uint
-        self._dll.VCI_InitCAN.argtypes = [
+
+        # --- 探测接口栈 ---
+        has_vci = hasattr(self._dll, "VCI_OpenDevice")
+        has_zcan = hasattr(self._dll, "ZCAN_OpenDevice")
+
+        if has_vci and not has_zcan:
+            self._init_vci()
+        elif has_zcan:
+            self._init_zlgcan()
+        elif has_vci and has_zcan:
+            # 两个都导出：选 zlgcan（新栈支持 x64，覆盖更多场景）
+            self._init_zlgcan()
+        else:
+            raise ImportError(
+                f"{dll_file.name} 不是有效的 ZLG CAN DLL：既没有 VCI_OpenDevice 也没有 ZCAN_OpenDevice。\n"
+                f"请确认这是 ControlCAN.dll（旧栈）或 zlgcan.dll（新栈）。"
+            )
+
+    # ----- ControlCAN（VCI 旧栈）-----
+
+    def _init_vci(self) -> None:
+        dll = self._dll
+        dll.VCI_OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        dll.VCI_OpenDevice.restype = ctypes.c_uint
+        dll.VCI_InitCAN.argtypes = [
             ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(_VCI_INIT_CONFIG)
         ]
-        self._dll.VCI_InitCAN.restype = ctypes.c_uint
-        self._dll.VCI_StartCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-        self._dll.VCI_StartCAN.restype = ctypes.c_uint
-        self._dll.VCI_Transmit.argtypes = [
+        dll.VCI_InitCAN.restype = ctypes.c_uint
+        dll.VCI_StartCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        dll.VCI_StartCAN.restype = ctypes.c_uint
+        dll.VCI_Transmit.argtypes = [
             ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(_VCI_CAN_OBJ), ctypes.c_uint
         ]
-        self._dll.VCI_Transmit.restype = ctypes.c_uint
-        self._dll.VCI_CloseDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
-        self._dll.VCI_CloseDevice.restype = ctypes.c_uint
+        dll.VCI_Transmit.restype = ctypes.c_uint
+        dll.VCI_CloseDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        dll.VCI_CloseDevice.restype = ctypes.c_uint
 
-        if self._dll.VCI_OpenDevice(VCI_USBCAN2, device_index, 0) != 1:
+        if dll.VCI_OpenDevice(VCI_USBCAN2, self._device_index, 0) != 1:
             raise RuntimeError(
                 "打开 CANalyst-II 失败。请确认设备已连接、驱动已安装，"
                 "并关闭 CANTest / USB_CAN_Tool 等正在占用设备的软件。"
             )
 
-        # 250 kbit/s（8 MHz 时钟）：Timing0=0x01, Timing1=0x1C
         config = _VCI_INIT_CONFIG(0, 0xFFFFFFFF, 0, 1, 0x01, 0x1C, 0)
-        if self._dll.VCI_InitCAN(VCI_USBCAN2, device_index, channel, ctypes.byref(config)) != 1:
-            self._dll.VCI_CloseDevice(VCI_USBCAN2, device_index)
-            raise RuntimeError(f"CANalyst-II 通道 {channel} 初始化失败，请检查通道号。")
-        if self._dll.VCI_StartCAN(VCI_USBCAN2, device_index, channel) != 1:
-            self._dll.VCI_CloseDevice(VCI_USBCAN2, device_index)
-            raise RuntimeError(f"CANalyst-II 通道 {channel} 启动失败。")
+        if dll.VCI_InitCAN(VCI_USBCAN2, self._device_index, self._channel, ctypes.byref(config)) != 1:
+            dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
+            raise RuntimeError(f"CANalyst-II 通道 {self._channel} 初始化失败，请检查通道号。")
+        if dll.VCI_StartCAN(VCI_USBCAN2, self._device_index, self._channel) != 1:
+            dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
+            raise RuntimeError(f"CANalyst-II 通道 {self._channel} 启动失败。")
 
-    def send(self, msg: can.Message, timeout: float | None = None) -> None:
+        self._stack = "vci"
+
+    def _send_vci(self, msg: can.Message) -> None:
         data = bytes(msg.data)
         if len(data) > 8:
             raise ValueError("经典 CAN 帧数据不能超过 8 字节。")
@@ -375,26 +439,98 @@ class CanalystIIBus:
         obj.RemoteFlag = 0
         obj.ExternFlag = 1 if msg.is_extended_id else 0
         obj.DataLen = len(data)
-        for index, value in enumerate(data):
-            obj.Data[index] = value
+        for i, v in enumerate(data):
+            obj.Data[i] = v
         ret = self._dll.VCI_Transmit(
             VCI_USBCAN2, self._device_index, self._channel, ctypes.byref(obj), 1
         )
         if ret != 1:
             raise RuntimeError(f"CANalyst-II 发送失败（VCI_Transmit 返回 {ret}）。")
 
+    def _close_vci(self) -> None:
+        self._dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
+
+    # ----- zlgcan（新栈，向下兼容 CANalyst-II）-----
+
+    def _init_zlgcan(self) -> None:
+        dll = self._dll
+        dll.ZCAN_OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        dll.ZCAN_OpenDevice.restype = ctypes.c_uint
+        dll.ZCAN_InitCAN.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                                      ctypes.POINTER(_ZLG_INIT_CONFIG)]
+        dll.ZCAN_InitCAN.restype = ctypes.c_uint
+        dll.ZCAN_StartCAN.argtypes = [ctypes.c_uint]
+        dll.ZCAN_StartCAN.restype = ctypes.c_uint
+        dll.ZCAN_Transmit.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(_ZLG_TRANSMIT_DATA),
+                                       ctypes.c_uint]
+        dll.ZCAN_Transmit.restype = ctypes.c_uint
+        dll.ZCAN_CloseDevice.argtypes = [ctypes.c_uint]
+        dll.ZCAN_CloseDevice.restype = ctypes.c_uint
+
+        dev = dll.ZCAN_OpenDevice(ZLG_USBCAN2, self._device_index, 0)
+        if int(dev) == 0:
+            raise RuntimeError(
+                "打开 CANalyst-II（zlgcan 新栈）失败。请确认设备已连接、驱动已安装，"
+                "并关闭 CANTest / ZCANPRO 等正在占用设备的软件。"
+            )
+        self._dev_handle = dev
+
+        config = _ZLG_INIT_CONFIG(0, 0xFFFFFFFF, 0, 1, 0x01, 0x1C, 0)
+        chn = dll.ZCAN_InitCAN(dev, self._channel, 0, ctypes.byref(config))
+        if int(chn) == 0:
+            dll.ZCAN_CloseDevice(dev)
+            raise RuntimeError(f"zlgcan 通道 {self._channel} 初始化失败，请检查通道号。")
+        self._chn_handle = chn
+
+        if dll.ZCAN_StartCAN(chn) != 1:
+            dll.ZCAN_CloseDevice(dev)
+            raise RuntimeError(f"zlgcan 通道 {self._channel} 启动失败。")
+
+        self._stack = "zlgcan"
+
+    def _send_zlgcan(self, msg: can.Message) -> None:
+        data = bytes(msg.data)
+        if len(data) > 8:
+            raise ValueError("经典 CAN 帧数据不能超过 8 字节。")
+        frame = _ZLG_CAN_FRAME()
+        frame.can_id = msg.arbitration_id & 0x1FFFFFFF
+        frame.eff = 1 if msg.is_extended_id else 0
+        frame.can_dlc = len(data)
+        for i, v in enumerate(data):
+            frame.data[i] = v
+        tx = _ZLG_TRANSMIT_DATA(frame=frame, transmit_type=0)
+        ret = self._dll.ZCAN_Transmit(self._chn_handle, 0, ctypes.byref(tx), 1)
+        if ret != 1:
+            raise RuntimeError(f"zlgcan 发送失败（ZCAN_Transmit 返回 {ret}）。")
+
+    def _close_zlgcan(self) -> None:
+        self._dll.ZCAN_CloseDevice(self._dev_handle)
+
+    # ----- python-can 兼容接口 -----
+
+    def send(self, msg: can.Message, timeout: float | None = None) -> None:
+        if getattr(self, "_stack", "vci") == "zlgcan":
+            self._send_zlgcan(msg)
+        else:
+            self._send_vci(msg)
+
     def shutdown(self) -> None:
-        if not self._closed:
-            try:
-                self._dll.VCI_CloseDevice(VCI_USBCAN2, self._device_index)
-            finally:
-                self._closed = True
-                handle = getattr(self, "_dll_dir_handle", None)
-                if handle is not None:
-                    try:
-                        handle.close()
-                    except OSError:
-                        pass
+        if self._closed:
+            return
+        try:
+            stack = getattr(self, "_stack", "vci")
+            if stack == "zlgcan":
+                self._close_zlgcan()
+            else:
+                self._close_vci()
+        finally:
+            self._closed = True
+            handle = getattr(self, "_dll_dir_handle", None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
 
 
 # ------------------- 终端电流请求日志 -------------------
