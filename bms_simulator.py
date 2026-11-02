@@ -378,8 +378,24 @@ class CanalystIIBus:
             )
 
         # --- 探测接口栈 ---
+        # 先看 hasattr（依赖 PE 导出表），有些厂家 DLL 导出表损坏但字符串/导出仍可用，
+        # hasattr 会返回 False，这时回退到文件名启发式
+        dll_name = dll_file.name.lower()
         has_vci = hasattr(self._dll, "VCI_OpenDevice")
         has_zcan = hasattr(self._dll, "ZCAN_OpenDevice")
+
+        if not has_vci and not has_zcan:
+            if "zlgcan" in dll_name or "zlglink" in dll_name or "cloudcan" in dll_name:
+                has_zcan = True
+            elif "controlcan" in dll_name:
+                has_vci = True
+            else:
+                # 文件名也没线索，按 ControlCAN 旧栈尝试（经典 CAN 卡最常见）
+                has_vci = True
+                has_vci_fallback = True
+            stack_hint = "(文件名启发式)"
+        else:
+            stack_hint = "(PE 导出表)"
 
         if has_vci and not has_zcan:
             self._init_vci()
