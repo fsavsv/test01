@@ -1,0 +1,57 @@
+# ===================================================================
+# 电池 OTA 交替升级压测 - 配置文件
+# ===================================================================
+# 命令行参数优先级高于本文件（--count / --wait / --channel / --headless）
+
+# 执行轮次（1 轮 = 2 次升级：先升 v1.0.10，等 15 分钟，再升 v1.0.11）
+rounds: 2
+
+# 是否无头模式（true=不显示浏览器窗口，更快；false=显示窗口，便于观察）
+headless: false
+
+# 浏览器通道（msedge=微软Edge / chrome=谷歌Chrome / chromium=Playwright自带）
+# 本机无 Chrome，用 Windows 自带的 Edge
+browser_channel: "msedge"
+
+# 输出目录（日志、截图、HTML报告都存这里）
+output_dir: "./reports"
+
+# 日志级别（DEBUG / INFO / WARNING / ERROR）
+log_level: "DEBUG"
+
+# -------------------------------------------------------------------
+# 平台信息
+# -------------------------------------------------------------------
+platform:
+  base_url: "https://hdcloud-iot-webconsole-test.jd.com"
+  login:
+    username: "cabinet_zl"
+    password: "ngKvcW1Btu1lMj"
+    # 验证码识别错误时的最大重试次数
+    max_retry: 10
+  pages:
+    ota_job_list: "/#/ota/job/list"
+
+# -------------------------------------------------------------------
+# OTA 业务参数
+# -------------------------------------------------------------------
+ota:
+  # 交替升级的固件序列（一轮内按顺序各升一次，多轮全局严格交替：10 -> 11 -> 10 -> 11 ...）
+  firmware_sequence:
+    - "firmware-v2.3.16"
+    - "firmware-v2.3.45"
+  # 产品名称
+  product_name: "智莱换电柜"
+  # 升级模式
+  upgrade_mode: "立即升级"
+  # 升级范围
+  upgrade_scope: "指定设备"
+  # 指定设备范围
+  device_scope: "设备分组"
+  # 设备分组名称
+  group_name: "智莱测试"
+  # 每次升级后等待分钟数（不校验升级结果，仅等待）
+  wait_after_upgrade_minutes: 8
+  # 【方案A】启动新任务前，自动取消同固件的"运行中"任务
+  # 平台规定同一固件同时只允许 1 个 job 运行，不取消会被拒绝
+  cancel_running_before_start: true
