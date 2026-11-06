@@ -12,6 +12,13 @@
     多轮执行时全局严格交替：10 -> 11 -> 10 -> 11 ...
 
 【每次升级步骤】
+    0. 【新增】新增升级任务前的环境检查：
+       a) 列表中若有【已创建】状态的任务 -> 全部删除；
+       b) 无【已创建】任务时，检查【运行中】任务，点【查看进度】进任务详情读进度百分比：
+          - 进度 > 80% 或读不到进度百分比 -> 返回任务管理页，找到该任务点【取消】
+          - 进度 <= 80%                  -> 延长等待 2 分钟后再新增升级任务
+          （阈值与延长分钟数可配置：progress_threshold_percent /
+           extra_wait_for_low_progress_minutes）
     1. 进入 OTA 任务列表页  https://.../#/ota/job/list
     2. 点击【新增任务】
     3. 产品选择：智莱换电柜
@@ -116,6 +123,12 @@ class BatteryOTAStressTest(BaseStressTest):
             "wait_after_round_minutes": 8,      # 一轮结束后等待分钟数（最后一轮不等待）
             # 【方案A】启动新任务前自动取消同固件"运行中"任务
             "cancel_running_before_start": True,
+            # 新增任务前的环境检查（删除【已创建】+ 检查【运行中】进度）
+            "precheck_before_create": True,
+            # 运行中任务进度阈值：> 该值取消任务；<= 该值延长等待
+            "progress_threshold_percent": 80,
+            # 进度未达阈值时额外等待的分钟数
+            "extra_wait_for_low_progress_minutes": 2,
         },
     })
 
@@ -1083,6 +1096,328 @@ class BatteryOTAStressTest(BaseStressTest):
                 continue
 
     # ============================================================
+    # 【新增】新增升级任务前的任务检查
+    #   1) 有【已创建】状态的任务 -> 全部删除
+    #   2) 无【已创建】任务时，检查【运行中】任务进度：
+    #      - 进度 > 阈值 或 读不到进度 -> 返回列表取消该任务
+    #      - 进度 <= 阈值            -> 额外等待 N 分钟后继续新增任务
+    # ============================================================
+    @staticmethod
+    def _is_header_row(txt: str) -> bool:
+        """判断表格行是否为表头行。"""
+        return "任务名称" in txt and "操作" in txt
+
+    def _row_name_snippet(self, row) -> str:
+        """取行首列（任务名称）文本，用于从详情页返回列表后重新定位该行。"""
+        try:
+            cell = row.locator("td").first
+            if cell.count() > 0:
+                return (cell.inner_text() or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _find_row_by_snippet(self, snippet: str, status_keyword: str = ""):
+        """在任务列表中按名称片段（可叠加状态关键字）重新定位行。"""
+        if not snippet:
+            return None
+        try:
+            rows = self.page.locator("tr")
+            count = min(rows.count(), 30)
+        except Exception:
+            return None
+        key = snippet[:20]
+        for i in range(count):
+            row = rows.nth(i)
+            try:
+                txt = row.inner_text() or ""
+                cell = (row.locator("td").first.inner_text() or "").strip()
+            except Exception:
+                continue
+            if self._is_header_row(txt):
+                continue
+            if key not in cell and key not in txt:
+                continue
+            if status_keyword and status_keyword not in txt:
+                continue
+            return row
+        return None
+
+    def _click_row_action(self, row, action: str, desc: str) -> bool:
+        """点击行内操作按钮（精确文本优先，避免点偏到相邻操作）。"""
+        if self._click_first_visible(row.get_by_text(action, exact=True), 2500):
+            self.logger.info(f"  [OK] 已点击【{desc}】")
+            return True
+        btn = row.locator(
+            f"button:has-text('{action}'), a:has-text('{action}'), span:text-is('{action}')")
+        if self._click_first_visible(btn, 2500):
+            self.logger.info(f"  [OK] 已点击【{desc}】")
+            return True
+        self.logger.warning(f"  未找到【{desc}】按钮")
+        return False
+
+    def _delete_created_tasks(self, run_index: int) -> int:
+        """删除任务列表中所有【已创建】状态的任务，返回删除数量。"""
+        self.log_step("检查是否存在【已创建】状态的任务")
+        deleted = 0
+        for _ in range(10):
+            target = None
+            try:
+                rows = self.page.locator("tr")
+                count = min(rows.count(), 30)
+            except Exception:
+                break
+            for i in range(count):
+                r = rows.nth(i)
+                try:
+                    txt = r.inner_text() or ""
+                except Exception:
+                    continue
+                if self._is_header_row(txt) or "已创建" not in txt:
+                    continue
+                target = r
+                break
+
+            if target is None:
+                break
+
+            name = self._row_name_snippet(target)
+            self.logger.info(f"  发现【已创建】任务：{name}，准备删除")
+            if not self._click_row_action(target, "删除", "删除"):
+                break
+            self.page.wait_for_timeout(1000)
+            self._confirm_popup_if_any()  # 删除二次确认弹窗
+            self.page.wait_for_timeout(1500)
+            try:
+                self.page.reload(wait_until="domcontentloaded")
+                self.page.wait_for_timeout(2000)
+                self._dismiss_leave_confirm()
+            except Exception:
+                pass
+            deleted += 1
+            self.logger.info(f"  [OK] 已删除【已创建】任务：{name}")
+
+        if deleted:
+            self.screenshot("after_delete_created", run_index)
+        self.logger.info(f"  【已创建】任务清理完成，共删除 {deleted} 个")
+        return deleted
+
+    def _read_progress_percent(self):
+        """
+        读取当前任务详情页的进度百分比；读不到返回 None。
+        依次尝试：进度组件文本 -> 进度条宽度样式 -> 页面全文正则兜底。
+        """
+        # 1. 进度组件文本（如 "80%"、"80.5%"）
+        for sel in [".el-progress__text", ".ant-progress-text", "[class*='progress']",
+                    "[class*='percent']", "[class*='rate']"]:
+            try:
+                loc = self.page.locator(sel)
+                count = min(loc.count(), 20)
+            except Exception:
+                continue
+            for i in range(count):
+                item = loc.nth(i)
+                try:
+                    if not item.is_visible():
+                        continue
+                    t = (item.inner_text(timeout=300) or "").strip()
+                except Exception:
+                    continue
+                m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", t)
+                if m:
+                    val = float(m.group(1))
+                    self.logger.info(f"  详情页进度（组件）：{val}%（原文 {t[:40]}）")
+                    return val
+
+        # 2. 进度条宽度/组件（JS 兜底，兼容用 style="width:80%" 实现的进度条）
+        try:
+            val = self.page.evaluate(
+                """
+                () => {
+                    const vals = [];
+                    document.querySelectorAll('[class*="progress"], [class*="percent"], [class*="progressbar"]').forEach(el => {
+                        const st = el.getAttribute('style') || '';
+                        const m = st.match(/width\\s*:\\s*(\\d{1,3}(?:\\.\\d+)?)%/);
+                        if (m) vals.push(parseFloat(m[1]));
+                        if (el.children.length <= 2) {
+                            const t = (el.innerText || '').match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
+                            if (t) vals.push(parseFloat(t[1]));
+                        }
+                    });
+                    return vals.length ? Math.max(...vals) : null;
+                }
+                """
+            )
+        except Exception:
+            val = None
+        if val is not None:
+            try:
+                val = float(val)
+                self.logger.info(f"  详情页进度（样式/组件宽度）：{val}%")
+                return val
+            except Exception:
+                pass
+
+        # 3. 页面全文兜底：取所有百分比中的最大值（更接近总进度）
+        try:
+            body = self.page.inner_text("body", timeout=3000) or ""
+            nums = [float(x) for x in re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", body)]
+            nums = [n for n in nums if 0 <= n <= 100]
+            if nums:
+                self.logger.info(f"  详情页进度（全文匹配，共 {len(nums)} 处）：取最大 {max(nums)}%")
+                return max(nums)
+        except Exception:
+            pass
+        return None
+
+    def _inspect_running_task_progress(self, row, run_index: int):
+        """
+        点击【查看进度】进入任务详情页，读取进度百分比，然后返回任务列表页。
+        读不到进度返回 None。
+        """
+        list_page = self.page
+        pages_before = len(self.context.pages)
+
+        if not self._click_row_action(row, "查看进度", "查看进度"):
+            return None
+        self.page.wait_for_timeout(2500)
+
+        # 详情页可能在新标签页打开，也可能在当前标签页做路由跳转
+        detail_page = None
+        try:
+            pages = self.context.pages
+            if len(pages) > pages_before:
+                for p in pages[pages_before:]:
+                    if p is not list_page:
+                        detail_page = p
+                if detail_page is not None:
+                    detail_page.bring_to_front()
+                    self.page = detail_page
+                    self.page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        self.screenshot("task_detail_progress", run_index)
+        percent = self._read_progress_percent()
+
+        # 返回任务列表页
+        try:
+            if detail_page is not None:
+                try:
+                    detail_page.close()
+                except Exception:
+                    pass
+                self.page = list_page
+                try:
+                    list_page.bring_to_front()
+                except Exception:
+                    pass
+                list_page.wait_for_timeout(1000)
+            else:
+                self.page = list_page
+                list_page.goto(self._ota_list_url(), wait_until="domcontentloaded", timeout=30000)
+                list_page.wait_for_timeout(2000)
+                self._dismiss_leave_confirm()
+                list_page.wait_for_timeout(1000)
+        except Exception as e:
+            self.logger.warning(f"  从任务详情返回列表页异常: {e}")
+            try:
+                self.page = list_page
+                list_page.goto(self._ota_list_url(), wait_until="domcontentloaded", timeout=30000)
+                list_page.wait_for_timeout(2000)
+            except Exception:
+                pass
+        return percent
+
+    def _cancel_task_by_snippet(self, snippet: str, run_index: int, desc: str = "") -> bool:
+        """返回列表后按名称片段重新找到任务并点击【取消】。"""
+        row = self._find_row_by_snippet(snippet, "运行中")
+        if row is None:
+            row = self._find_row_by_snippet(snippet)
+        if row is None:
+            self.logger.warning(f"  返回列表后未找到任务【{snippet}】，无法取消")
+            return False
+        if not self._click_row_action(row, "取消", "取消"):
+            return False
+        self.page.wait_for_timeout(1500)
+        self._confirm_popup_if_any()  # 取消确认弹窗
+        self.page.wait_for_timeout(2000)
+        try:
+            self.page.reload(wait_until="domcontentloaded")
+            self.page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        self.screenshot("after_cancel_running", run_index)
+        self.logger.info(f"  [OK] 已取消任务【{snippet}】{desc}")
+        return True
+
+    def _check_running_tasks_before_create(self, run_index: int) -> float:
+        """
+        进入每个运行中任务的详情读取进度百分比，并按规则处理：
+          - 进度 > 阈值          -> 返回列表取消该任务
+          - 读不到进度百分比      -> 返回列表取消该任务
+          - 进度 <= 阈值         -> 延长等待 N 分钟后再新增升级任务（不取消）
+        返回需要额外等待的分钟数（无需额外等待返回 0）。
+        """
+        ota_cfg = self.config["ota"]
+        threshold = float(ota_cfg.get("progress_threshold_percent", 80))
+        extra_wait = float(ota_cfg.get("extra_wait_for_low_progress_minutes", 2))
+
+        self.log_step("检查是否存在【运行中】状态的任务")
+        for _ in range(5):
+            running_row = None
+            try:
+                rows = self.page.locator("tr")
+                count = min(rows.count(), 30)
+            except Exception:
+                return 0.0
+            for i in range(count):
+                r = rows.nth(i)
+                try:
+                    txt = r.inner_text() or ""
+                except Exception:
+                    continue
+                if self._is_header_row(txt) or "运行中" not in txt:
+                    continue
+                running_row = r
+                break
+
+            if running_row is None:
+                self.logger.info("  无【运行中】任务，继续新增升级任务")
+                return 0.0
+
+            snippet = self._row_name_snippet(running_row)
+            self.logger.info(f"  发现【运行中】任务：{snippet}，进入详情查看进度")
+            percent = self._inspect_running_task_progress(running_row, run_index)
+
+            if percent is None:
+                self.logger.warning("  详情页未读到进度百分比，返回列表取消该任务")
+                self._cancel_task_by_snippet(snippet, run_index)
+                continue
+
+            self.logger.info(f"  详情页进度 {percent}%（阈值 {threshold}%）")
+            if percent > threshold:
+                self.logger.info("  进度已超过阈值，返回列表取消该任务")
+                self._cancel_task_by_snippet(snippet, run_index)
+                continue
+
+            self.logger.info(f"  进度未超过阈值，延长等待 {extra_wait} 分钟后再新增升级任务")
+            return extra_wait
+
+        self.logger.warning("  运行中任务处理次数已达上限，继续新增升级任务")
+        return 0.0
+
+    def _precheck_before_create_task(self, run_index: int) -> float:
+        """新增升级任务前的环境检查，返回需要额外等待的分钟数。"""
+        ota_cfg = self.config["ota"]
+        if not ota_cfg.get("precheck_before_create", True):
+            return 0.0
+        # 1. 先删除所有【已创建】状态的任务
+        self._delete_created_tasks(run_index)
+        # 2. 再检查【运行中】任务进度
+        return self._check_running_tasks_before_create(run_index)
+
+    # ============================================================
     # 【方案A】启动前自动取消同固件"运行中"任务
     # ============================================================
     def _cancel_running_tasks_same_firmware(self, firmware: str, run_index: int):
@@ -1229,7 +1564,8 @@ class BatteryOTAStressTest(BaseStressTest):
 
     def _do_one_upgrade(self, firmware: str, run_index: int, seq_in_round: int) -> dict:
         """
-        执行一次完整升级：新增任务 -> 保存 -> 【方案A】取消同固件运行中任务 -> 启动。
+        执行一次完整升级：新增任务前的环境检查 -> 新增任务 -> 保存
+        -> 【方案A】取消同固件运行中任务 -> 启动。
         返回该次升级的阶段结果。
         """
         # 任务名称 = 固件版本 + 日期时分秒（精确到秒，不重复）
@@ -1242,6 +1578,15 @@ class BatteryOTAStressTest(BaseStressTest):
 
         try:
             self._navigate_to_ota_list(run_index)
+            # 【新增】新增任务前的环境检查：
+            #   1) 删除所有【已创建】状态的任务
+            #   2) 检查【运行中】任务进度，必要时取消或延长等待
+            extra_wait = self._precheck_before_create_task(run_index)
+            if extra_wait > 0:
+                self.log_step(f"运行中任务进度未达阈值，延长等待 {extra_wait} 分钟后继续")
+                wait_with_progress(int(extra_wait * 60), self.logger,
+                                   "运行中任务进度等待中",
+                                   interval_seconds=60)
             # 填表阶段对"下拉选项异步加载失败（暂无数据）"重试 1 次：
             # 重新回列表->重新进入新增页->重新填表（此阶段尚未保存，不会产生重复任务）
             for form_attempt in range(2):

@@ -5,7 +5,7 @@
 
 # 执行轮次（1 轮 = 2 次升级：先升 v1.0.10，等 15 分钟，再升 v1.0.11；
 # 一轮结束后再等 wait_after_round_minutes 分钟进入下一轮）
-rounds: 2
+rounds: 100
 
 # 是否无头模式（true=不显示浏览器窗口，更快；false=显示窗口，便于观察）
 headless: false
@@ -39,8 +39,8 @@ platform:
 ota:
   # 交替升级的固件序列（一轮内按顺序各升一次，多轮全局严格交替：10 -> 11 -> 10 -> 11 ...）
   firmware_sequence:
-    - "firmware-v2.3.16"
-    - "firmware-v2.3.45"
+    - "app-v2.4.42"
+    - "app-v2.4.14"
   # 产品名称
   product_name: "智莱换电柜"
   # 升级模式
@@ -52,9 +52,18 @@ ota:
   # 设备分组名称
   group_name: "智莱测试"
   # 每次升级后等待分钟数（不校验升级结果，仅等待）
-  wait_after_upgrade_minutes: 8
+  wait_after_upgrade_minutes: 5
   # 一轮结束后等待分钟数，之后才进入下一轮（最后一轮结束后不再等待）
-  wait_after_round_minutes: 8
+  wait_after_round_minutes: 5
   # 【方案A】启动新任务前，自动取消同固件的"运行中"任务
   # 平台规定同一固件同时只允许 1 个 job 运行，不取消会被拒绝
   cancel_running_before_start: true
+  # 【新增】新增升级任务前的环境检查
+  # 1) 列表中有【已创建】状态的任务 -> 全部删除
+  # 2) 无【已创建】任务 -> 检查【运行中】任务：点【查看进度】看详情页进度百分比
+  precheck_before_create: true
+  # 运行中任务进度阈值（%）：进度 > 该值 -> 返回列表取消该任务
+  #                        进度 <= 该值 -> 延长等待后继续新增任务
+  progress_threshold_percent: 80
+  # 运行中任务进度未达阈值时，额外延长等待的分钟数
+  extra_wait_for_low_progress_minutes: 2
