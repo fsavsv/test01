@@ -16,7 +16,10 @@
        a) 列表中若有【已创建】状态的任务 -> 全部删除；
        b) 无【已创建】任务时，检查【运行中】任务，点【查看进度】进任务详情读进度百分比：
           - 进度 > 80% 或读不到进度百分比 -> 返回任务管理页，找到该任务点【取消】
-          - 进度 <= 80%                  -> 延长等待 2 分钟后再新增升级任务
+          - 进度 <= 80%                  -> 延长等待 2 分钟后再次检查进度：
+                                            等待结束后仍小于 80%（或读不到进度）
+                                            -> 返回任务管理页点【取消】；
+                                            等待期间任务自行完成则无需取消
           （阈值与延长分钟数可配置：progress_threshold_percent /
            extra_wait_for_low_progress_minutes）
     1. 进入 OTA 任务列表页  https://.../#/ota/job/list
@@ -1100,7 +1103,9 @@ class BatteryOTAStressTest(BaseStressTest):
     #   1) 有【已创建】状态的任务 -> 全部删除
     #   2) 无【已创建】任务时，检查【运行中】任务进度：
     #      - 进度 > 阈值 或 读不到进度 -> 返回列表取消该任务
-    #      - 进度 <= 阈值            -> 额外等待 N 分钟后继续新增任务
+    #      - 进度 <= 阈值            -> 额外等待 N 分钟后再查一次：
+    #                                   等待结束后仍小于阈值/读不到进度 -> 取消该任务
+    #                                   （等待期间任务自行完成则无需取消）
     # ============================================================
     @staticmethod
     def _is_header_row(txt: str) -> bool:
@@ -1351,13 +1356,15 @@ class BatteryOTAStressTest(BaseStressTest):
         self.logger.info(f"  [OK] 已取消任务【{snippet}】{desc}")
         return True
 
-    def _check_running_tasks_before_create(self, run_index: int) -> float:
+    def _check_running_tasks_before_create(self, run_index: int):
         """
         进入每个运行中任务的详情读取进度百分比，并按规则处理：
           - 进度 > 阈值          -> 返回列表取消该任务
           - 读不到进度百分比      -> 返回列表取消该任务
-          - 进度 <= 阈值         -> 延长等待 N 分钟后再新增升级任务（不取消）
-        返回需要额外等待的分钟数（无需额外等待返回 0）。
+          - 进度 <= 阈值         -> 延长等待 N 分钟后再次检查进度：
+                                    等待结束后进度仍小于阈值（或仍读不到进度）
+                                    -> 返回列表取消该任务；
+                                    等待期间任务自行完成则无需取消。
         """
         ota_cfg = self.config["ota"]
         threshold = float(ota_cfg.get("progress_threshold_percent", 80))
@@ -1370,7 +1377,7 @@ class BatteryOTAStressTest(BaseStressTest):
                 rows = self.page.locator("tr")
                 count = min(rows.count(), 30)
             except Exception:
-                return 0.0
+                return
             for i in range(count):
                 r = rows.nth(i)
                 try:
@@ -1384,7 +1391,7 @@ class BatteryOTAStressTest(BaseStressTest):
 
             if running_row is None:
                 self.logger.info("  无【运行中】任务，继续新增升级任务")
-                return 0.0
+                return
 
             snippet = self._row_name_snippet(running_row)
             self.logger.info(f"  发现【运行中】任务：{snippet}，进入详情查看进度")
@@ -1401,21 +1408,54 @@ class BatteryOTAStressTest(BaseStressTest):
                 self._cancel_task_by_snippet(snippet, run_index)
                 continue
 
-            self.logger.info(f"  进度未超过阈值，延长等待 {extra_wait} 分钟后再新增升级任务")
-            return extra_wait
+            # 进度未达阈值：延长等待 N 分钟后再次检查该任务进度
+            self.log_step(f"运行中任务进度 {percent}% 未达阈值 {threshold}%，"
+                          f"延长等待 {extra_wait} 分钟后再次检查")
+            wait_with_progress(int(extra_wait * 60), self.logger,
+                               f"运行中任务【{snippet[:20]}】进度等待中",
+                               interval_seconds=60)
+
+            # 等待结束：回到列表重新定位该任务（期间任务可能已自行完成）
+            try:
+                if self._is_on_ota_list():
+                    self.page.reload(wait_until="domcontentloaded")
+                else:
+                    self.page.goto(self._ota_list_url(), wait_until="domcontentloaded", timeout=30000)
+                    self._dismiss_leave_confirm()
+                self.page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            row2 = self._find_row_by_snippet(snippet, "运行中")
+            if row2 is None:
+                self.logger.info(f"  等待结束后任务【{snippet}】已不在运行中列表"
+                                 "（可能已自行完成），继续检查其他运行中任务")
+                continue
+
+            percent2 = self._inspect_running_task_progress(row2, run_index)
+            if percent2 is None:
+                self.logger.warning("  等待结束后仍未读到进度百分比，返回列表取消该任务")
+                self._cancel_task_by_snippet(snippet, run_index)
+                continue
+            self.logger.info(f"  等待结束后进度 {percent2}%（阈值 {threshold}%）")
+            if percent2 < threshold:
+                self.logger.info("  等待结束后进度仍小于阈值，返回列表取消该任务")
+            else:
+                self.logger.info("  等待结束后进度已达到/超过阈值，按规则返回列表取消该任务")
+            self._cancel_task_by_snippet(snippet, run_index)
+            continue
 
         self.logger.warning("  运行中任务处理次数已达上限，继续新增升级任务")
-        return 0.0
 
-    def _precheck_before_create_task(self, run_index: int) -> float:
-        """新增升级任务前的环境检查，返回需要额外等待的分钟数。"""
+    def _precheck_before_create_task(self, run_index: int):
+        """新增升级任务前的环境检查：删除【已创建】任务 + 按进度处理【运行中】任务。"""
         ota_cfg = self.config["ota"]
         if not ota_cfg.get("precheck_before_create", True):
-            return 0.0
+            return
         # 1. 先删除所有【已创建】状态的任务
         self._delete_created_tasks(run_index)
         # 2. 再检查【运行中】任务进度
-        return self._check_running_tasks_before_create(run_index)
+        self._check_running_tasks_before_create(run_index)
 
     # ============================================================
     # 【方案A】启动前自动取消同固件"运行中"任务
@@ -1580,13 +1620,9 @@ class BatteryOTAStressTest(BaseStressTest):
             self._navigate_to_ota_list(run_index)
             # 【新增】新增任务前的环境检查：
             #   1) 删除所有【已创建】状态的任务
-            #   2) 检查【运行中】任务进度，必要时取消或延长等待
-            extra_wait = self._precheck_before_create_task(run_index)
-            if extra_wait > 0:
-                self.log_step(f"运行中任务进度未达阈值，延长等待 {extra_wait} 分钟后继续")
-                wait_with_progress(int(extra_wait * 60), self.logger,
-                                   "运行中任务进度等待中",
-                                   interval_seconds=60)
+            #   2) 检查【运行中】任务进度：> 阈值/读不到进度 -> 取消；
+            #      <= 阈值 -> 延长等待后再查一次，仍不达标 -> 取消
+            self._precheck_before_create_task(run_index)
             # 填表阶段对"下拉选项异步加载失败（暂无数据）"重试 1 次：
             # 重新回列表->重新进入新增页->重新填表（此阶段尚未保存，不会产生重复任务）
             for form_attempt in range(2):
