@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-绿通设备编码批量提取工具
+设备升级清单生成工具
 
-流程：
+阶段一（绿通平台）：
   1. 读取 原始数据.xlsx 第一列站点，取末尾 5 位编号；
   2. 登录绿通后台，逐个查询电柜，取出绿通设备编码（cabinetNo）；
   3. 生成 目标设备升级文件.xlsx（原始站点 / 绿通设备编码）；
   4. 复制为 预备升级设备数据.xlsx，并用京东样柜表把绿通编码映射为 ZL 设备编码。
 
+阶段二（智莱采集平台）：
+  5. 登录智莱采集系统，创建（或复用）分组；
+  6. 按 ZL 设备编码逐个搜索设备、勾选并加入分组；
+  7. 回读分组设备列表，校验设备编码与预备升级设备数据.xlsx 完全一致。
+
 用法：
-  python green_tool.py
-  python green_tool.py --original 原始数据.xlsx --jd 京东320台样柜电柜号&ZL编码信息_20260817(1).xlsx
+  python green_tool.py                      # 两个阶段都执行
+  python green_tool.py --stage green        # 只生成 Excel
+  python green_tool.py --stage zl           # 只把现有 Excel 导入分组
+  python green_tool.py --group 工具测试分组  # 指定智莱分组名
 """
 
 import argparse
@@ -36,6 +43,12 @@ READY_FILE = "预备升级设备数据.xlsx"
 
 DEFAULT_ORIGINAL = "原始数据.xlsx"
 DEFAULT_JD = "京东320台样柜电柜号&ZL编码信息_20260817(1).xlsx"
+
+ZL_BASE_URL = "https://battery.zhilai.com:81/api"
+ZL_TENANT_CODE = "100"
+ZL_USERNAME = "admin"
+ZL_PASSWORD = "Zhilai!@#2026"
+DEFAULT_GROUP = "工具测试分组"
 
 
 # ---------------------------------------------------------------- 数据读取
@@ -161,32 +174,158 @@ def write_ready(target_path: Path, mapping: dict[str, str], outdir: Path) -> tup
     return ready_path, df
 
 
+# ---------------------------------------------------------------- 智莱平台
+
+class ZlClient:
+    """智莱物联网采集平台（RuoYi）接口客户端"""
+
+    def __init__(self, username: str, password: str, tenant_code: str):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Origin": "https://battery.zhilai.com:81",
+            "Referer": "https://battery.zhilai.com:81/index",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+        })
+        self.username = username
+        self.password = password
+        self.tenant_code = tenant_code
+
+    def _request(self, method: str, path: str, **kwargs):
+        resp = self.session.request(method, f"{ZL_BASE_URL}{path}", timeout=30, **kwargs)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != 200:
+            raise RuntimeError(f"{path} 调用失败: {body.get('msg')}")
+        return body
+
+    def login(self) -> dict:
+        body = self._request("POST", "/login", json={
+            "username": self.username,
+            "password": self.password,
+            "code": "",
+            "uuid": "",
+            "tenantCode": self.tenant_code,
+        })
+        self.session.headers["Authorization"] = f"Bearer {body['token']}"
+        return body
+
+    def find_groups(self) -> list[dict]:
+        body = self._request("GET", "/device/device-group/list",
+                             params={"pageNum": 1, "pageSize": 200})
+        return body.get("data") or []
+
+    def ensure_group(self, group_name: str) -> str:
+        for group in self.find_groups():
+            if group.get("groupName") == group_name:
+                return str(group["id"])
+
+        self._request("POST", "/device/device-group",
+                      json={"groupName": group_name, "parentId": "0"})
+        for group in self.find_groups():
+            if group.get("groupName") == group_name:
+                return str(group["id"])
+        raise RuntimeError(f"分组创建后未查询到: {group_name}")
+
+    def group_devices(self, group_id: str) -> list[dict]:
+        devices, page = [], 1
+        while True:
+            body = self._request("GET", "/device/device/list-by-group-id", params={
+                "pageNum": page, "pageSize": 200, "groupId": group_id,
+            })
+            rows = body.get("rows") or []
+            devices.extend(rows)
+            if not rows or len(devices) >= int(body.get("total") or 0):
+                return devices
+            page += 1
+
+    def search_available_device(self, device_name: str, group_id: str) -> list[dict]:
+        body = self._request("GET", "/device/device/list-not-cur-group-device", params={
+            "pageNum": 1, "pageSize": 20, "deviceName": device_name, "groupId": group_id,
+        })
+        return [row for row in (body.get("rows") or [])
+                if str(row.get("deviceName", "")).strip() == device_name]
+
+    def add_devices(self, group_id: str, device_ids: list[str]):
+        self._request("POST", "/device/device/add-device-group",
+                      json={"deviceIds": device_ids, "groupId": group_id})
+
+
+def run_zl(ready_path: Path, group_name: str, interval: float) -> int:
+    if not ready_path.exists():
+        sys.exit(f"找不到预备升级设备数据: {ready_path}")
+
+    df = pd.read_excel(ready_path, dtype=str).fillna("")
+    codes = [str(code).strip() for code in df["ZL设备编码"] if str(code).strip()]
+    duplicates = sorted({c for c in codes if codes.count(c) > 1})
+    if duplicates:
+        print(f"注意：表内存在重复 ZL 编码 {duplicates}")
+        codes = list(dict.fromkeys(codes))
+
+    invalid = [c for c in codes if not re.fullmatch(r"\d{18}", c)]
+    if invalid:
+        print(f"注意：{len(invalid)} 个编码格式异常，将跳过: {invalid[:10]}")
+
+    client = ZlClient(ZL_USERNAME, ZL_PASSWORD, ZL_TENANT_CODE)
+    client.login()
+    print(f"智莱平台登录成功，待处理 ZL 编码 {len(codes)} 个")
+
+    group_id = client.ensure_group(group_name)
+    existing = {str(row.get("deviceName", "")).strip()
+                for row in client.group_devices(group_id)}
+    print(f"分组「{group_name}」id={group_id}，现有设备 {len(existing)} 台")
+
+    added, skipped, missing = [], [], []
+    for idx, code in enumerate(codes, 1):
+        if code in existing:
+            skipped.append(code)
+            print(f"[{idx}/{len(codes)}] {code} 已在分组，跳过")
+            continue
+
+        rows = client.search_available_device(code, group_id)
+        if not rows:
+            missing.append(code)
+            print(f"[{idx}/{len(codes)}] {code} 未搜索到设备")
+            continue
+
+        client.add_devices(group_id, [str(rows[0]["id"])])
+        added.append(code)
+        print(f"[{idx}/{len(codes)}] {code} 已加入分组")
+        time.sleep(interval)
+
+    # 回读分组设备列表做一致性校验
+    final_codes = {str(row.get("deviceName", "")).strip()
+                   for row in client.group_devices(group_id)}
+    not_in_group = [c for c in codes if c not in final_codes]
+    extra = sorted(final_codes - set(codes))
+
+    print("\n分组导入结果:")
+    print(f"  本次新增 {len(added)} 台，已存在跳过 {len(skipped)} 台，"
+          f"未搜到 {len(missing)} 台")
+    print(f"  分组内设备 {len(final_codes)} 台，目标编码覆盖 "
+          f"{len(codes) - len(not_in_group)}/{len(codes)}")
+    if extra:
+        print(f"  分组内另有 {len(extra)} 台不在本次清单中: {extra[:10]}")
+
+    if not_in_group:
+        print("  校验不一致（未在分组内）:")
+        for code in not_in_group:
+            print(f"    {code}")
+        return 1
+    print("  校验通过：分组内设备编码与预备升级设备数据完全一致")
+    return 0
+
+
 # ---------------------------------------------------------------- 主流程
 
-def main():
-    parser = argparse.ArgumentParser(description="绿通设备编码批量提取")
-    parser.add_argument("--original", default=DEFAULT_ORIGINAL, help="原始数据.xlsx 路径")
-    parser.add_argument("--jd", default=DEFAULT_JD, help="京东样柜电柜号&ZL编码信息.xlsx 路径")
-    parser.add_argument("--outdir", default="输出", help="输出目录")
-    parser.add_argument("--interval", type=float, default=0.2, help="每次查询间隔秒数")
-    args = parser.parse_args()
-
-    original_path = Path(args.original)
-    jd_path = Path(args.jd)
-    outdir = Path(args.outdir)
-
-    if not original_path.exists():
-        sys.exit(f"找不到原始数据文件: {original_path}")
-    if not jd_path.exists():
-        sys.exit(f"找不到京东样柜文件: {jd_path}")
-    outdir.mkdir(parents=True, exist_ok=True)
-
+def run_green(original_path: Path, jd_path: Path, outdir: Path, interval: float) -> tuple[Path, int]:
     sites = load_sites(original_path)
     print(f"读取原始站点 {len(sites)} 条")
 
     client = GreenClient(USERNAME, PASSWORD)
     info = client.login()
-    print(f"登录成功：{info.get('realName')} (accountId={info.get('accountId')})")
+    print(f"绿通平台登录成功：{info.get('realName')} (accountId={info.get('accountId')})")
 
     results = []
     for idx, site in enumerate(sites, 1):
@@ -200,7 +339,7 @@ def main():
         results.append({"原始站点": raw_site, "绿通设备编码": green_code or "", "备注": note})
         flag = green_code if green_code else f"未匹配（{note}）"
         print(f"[{idx}/{len(sites)}] {raw_site} -> {flag}")
-        time.sleep(args.interval)
+        time.sleep(interval)
 
     target_path = write_target(results, outdir)
     print(f"\n已生成: {target_path}")
@@ -218,7 +357,41 @@ def main():
         print("未匹配明细:")
         for _, row in df[df["ZL设备编码"] == ""].iterrows():
             print(f"  {row['原始站点']}  绿通={row['绿通设备编码'] or '空'}")
-        sys.exit(1)
+        return ready_path, 1
+    return ready_path, 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="设备升级清单生成与分组导入工具")
+    parser.add_argument("--stage", choices=["all", "green", "zl"], default="all",
+                        help="all=生成 Excel 并导入分组；green=只生成 Excel；zl=只导入分组")
+    parser.add_argument("--original", default=DEFAULT_ORIGINAL, help="原始数据.xlsx 路径")
+    parser.add_argument("--jd", default=DEFAULT_JD, help="京东样柜电柜号&ZL编码信息.xlsx 路径")
+    parser.add_argument("--outdir", default="输出", help="输出目录")
+    parser.add_argument("--group", default=DEFAULT_GROUP, help="智莱平台分组名称")
+    parser.add_argument("--ready", default=None,
+                        help="预备升级设备数据.xlsx 路径，默认取输出目录下的文件")
+    parser.add_argument("--interval", type=float, default=0.2, help="每次请求间隔秒数")
+    args = parser.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ready_path = Path(args.ready) if args.ready else outdir / READY_FILE
+
+    exit_code = 0
+    if args.stage in ("all", "green"):
+        original_path = Path(args.original)
+        jd_path = Path(args.jd)
+        if not original_path.exists():
+            sys.exit(f"找不到原始数据文件: {original_path}")
+        if not jd_path.exists():
+            sys.exit(f"找不到京东样柜文件: {jd_path}")
+        ready_path, exit_code = run_green(original_path, jd_path, outdir, args.interval)
+
+    if args.stage in ("all", "zl"):
+        exit_code = run_zl(ready_path, args.group, args.interval) or exit_code
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
