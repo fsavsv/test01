@@ -51,6 +51,13 @@ ZL_PASSWORD = "Zhilai!@#2026"
 DEFAULT_GROUP = "工具测试分组"
 
 
+def app_dir() -> Path:
+    """程序所在目录：打包成 exe 后取 exe 目录，源码运行时取脚本目录"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 # ---------------------------------------------------------------- 数据读取
 
 def extract_5_digits(site_text: str) -> str:
@@ -365,9 +372,11 @@ def main():
     parser = argparse.ArgumentParser(description="设备升级清单生成与分组导入工具")
     parser.add_argument("--stage", choices=["all", "green", "zl"], default="all",
                         help="all=生成 Excel 并导入分组；green=只生成 Excel；zl=只导入分组")
-    parser.add_argument("--original", default=DEFAULT_ORIGINAL, help="原始数据.xlsx 路径")
-    parser.add_argument("--jd", default=DEFAULT_JD, help="京东样柜电柜号&ZL编码信息.xlsx 路径")
-    parser.add_argument("--outdir", default="输出", help="输出目录")
+    parser.add_argument("--original", default=str(app_dir() / DEFAULT_ORIGINAL),
+                        help="原始数据.xlsx 路径")
+    parser.add_argument("--jd", default=str(app_dir() / DEFAULT_JD),
+                        help="京东样柜电柜号&ZL编码信息.xlsx 路径")
+    parser.add_argument("--outdir", default=str(app_dir() / "输出"), help="输出目录")
     parser.add_argument("--group", default=DEFAULT_GROUP, help="智莱平台分组名称")
     parser.add_argument("--ready", default=None,
                         help="预备升级设备数据.xlsx 路径，默认取输出目录下的文件")
@@ -395,4 +404,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if getattr(sys, "frozen", False) and len(sys.argv) == 1:
+        # 双击 exe 运行时，交互式确认分组并在结束后保留窗口
+        group = input(f"请输入智莱分组名称（回车使用 {DEFAULT_GROUP}）：").strip()
+        if group:
+            sys.argv += ["--group", group]
+        try:
+            main()
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print(f"\n执行失败: {exc.code}")
+            input("\n按回车键退出...")
+    else:
+        main()
